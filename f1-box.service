@@ -1,0 +1,17 @@
+[Unit]
+Description=F1 flag light box
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/pi/f1-box
+ExecStart=/usr/bin/python3 /home/pi/f1-box/f1_box.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
