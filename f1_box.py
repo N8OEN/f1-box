@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import time
 import urllib.parse
 from collections import deque
@@ -55,20 +56,38 @@ OPENF1_POLL_S = 6.0
 HTTP_PORT = 5000
 FRAME_HZ = 15
 LOG_LINES = 200
+MANUAL_HOLD_S = 30.0
 
 log = logging.getLogger("f1box")
 
 
 # ── Flag derivation ──────────────────────────────────────────
-# TrackStatus.Status codes. 7 is deliberately absent: it fires for both
-# safety car ending and VSC ending, so it needs the current state to
-# disambiguate. See _from_track_status.
+# Two things were wrong before this rewrite:
+#
+#   1. Every message replaced the whole flag state. A sector-scoped
+#      "CLEAR IN TRACK SECTOR 6" therefore went green mid-VSC.
+#   2. Nothing ever ended a flag except another flag, so chequered
+#      ran until the process died.
+#
+# The model now has three layers and one resolver:
+#
+#   neutralised   SC / VSC. Latched — sector messages cannot touch it.
+#                 Cleared only by TrackStatus AllClear or a Track-scoped
+#                 clear from race control.
+#   track         the track-wide baseline: GREEN / YELLOW / RED / CHEQUERED.
+#   sectors       {sector_no: flag}. Advisory. Shown only when nothing
+#                 higher-priority is live.
+#
+# resolve() picks the highest-priority live layer. Session finish
+# collapses the lot to OFF.
+
 TRACK_STATUS = {
-    "1": Flag.GREEN,
-    "2": Flag.YELLOW,
-    "4": Flag.SC,
-    "5": Flag.RED,
-    "6": Flag.VSC,
+    "1": "ALLCLEAR",
+    "2": "YELLOW",
+    "4": "SC",
+    "5": "RED",
+    "6": "VSC",
+    "7": "ENDING",   # fires for both SC and VSC ending — a warning, not the end
 }
 
 RC_FLAG = {
@@ -80,12 +99,35 @@ RC_FLAG = {
     "CHEQUERED": Flag.CHEQUERED,
 }
 
+PRIORITY = {
+    Flag.OFF: 0,
+    Flag.GREEN: 1,
+    Flag.YELLOW: 2,
+    Flag.DOUBLE_YELLOW: 3,
+    Flag.VSC: 4,
+    Flag.SC: 5,
+    Flag.RED: 6,
+    Flag.CHEQUERED: 7,
+}
+
+SECTOR_RE = re.compile(r"SECTOR\s+(\d+)", re.I)
+SESSION_OVER = ("finished", "finalised", "finalized", "ends", "aborted")
+
 
 class State:
     def __init__(self, renderer):
         self.renderer = renderer
+
+        # layers
+        self.track = Flag.OFF          # track-wide baseline
+        self.neutralised = None        # Flag.SC | Flag.VSC | None — latched
+        self.ending = False            # SC/VSC ending announced, not yet clear
+        self.sectors = {}              # {sector_no: Flag}
+        self.finished = False
+
+        # resolved
         self.flag = Flag.OFF
-        self.source = "idle"          # signalr | openf1 | replay | manual | idle
+        self.source = "idle"           # signalr | openf1 | replay | manual | idle
         self.session = "—"
         self.connected = False
         self.manual_until = 0.0
@@ -107,25 +149,76 @@ class State:
         log.info(text)
         self._push({"type": "log", "entry": entry})
 
-    # -- flag setting -----------------------------------------
-    def raise_flag(self, flag, source, note=None):
-        """Set the flag. Feed sources are ignored while a manual hold is on."""
+    # -- resolution -------------------------------------------
+    def resolve(self):
+        """Collapse the layers into the one flag the strip should show."""
+        if self.finished:
+            return Flag.OFF
+        if self.track == Flag.CHEQUERED:
+            return Flag.CHEQUERED
+        if self.track == Flag.RED:
+            return Flag.RED
+        if self.neutralised:
+            return self.neutralised
+        candidates = [self.track] + list(self.sectors.values())
+        return max(candidates, key=lambda f: PRIORITY.get(f, 0))
+
+    def commit(self, source, note=None):
+        """Re-resolve and render. Feed sources are ignored under a manual hold."""
         if source != "manual" and time.monotonic() < self.manual_until:
             return
         if source == "manual":
-            self.manual_until = time.monotonic() + 30.0
+            self.manual_until = time.monotonic() + MANUAL_HOLD_S
+        flag = self.resolve()
         changed = self.renderer.set_flag(flag)
         self.flag = flag
         self.source = source
-        if changed:
-            self.note(note or f"{Flag.LABEL[flag]} — {source}", kind=flag)
+        if note:
+            self.note(note, kind=flag)
+        elif changed:
+            self.note(f"{Flag.LABEL[flag]} — {source}", kind=flag)
         self._push(self.snapshot())
 
+    # -- layer mutation ---------------------------------------
+    def set_track(self, flag, source, note=None):
+        self.track = flag
+        self.commit(source, note)
+
+    def neutralise(self, flag, source, note=None):
+        self.neutralised = flag
+        self.ending = False
+        self.commit(source, note)
+
+    def release(self, source, note=None):
+        """Full clear: drop the SC/VSC latch and every sector flag."""
+        self.neutralised = None
+        self.ending = False
+        self.sectors.clear()
+        self.track = Flag.GREEN
+        self.commit(source, note)
+
+    def set_sector(self, sector, flag, source, note=None):
+        if flag == Flag.GREEN:
+            self.sectors.pop(sector, None)
+        else:
+            self.sectors[sector] = flag
+        self.commit(source, note)
+
+    def force(self, flag, source, note=None):
+        """Manual override — sets the baseline and wipes the layers."""
+        self.neutralised = flag if flag in (Flag.SC, Flag.VSC) else None
+        self.sectors.clear()
+        self.finished = False
+        self.track = Flag.OFF if flag in (Flag.SC, Flag.VSC) else flag
+        self.commit(source, note)
+
     def clear_manual(self):
+        if self.manual_until == 0.0:
+            return
         self.manual_until = 0.0
         self.source = "signalr" if self.connected else "idle"
         self.note("Manual hold released, following the feed again")
-        self._push(self.snapshot())
+        self.commit(self.source)
 
     def snapshot(self):
         return {
@@ -136,6 +229,9 @@ class State:
             "session": self.session,
             "connected": self.connected,
             "manual": time.monotonic() < self.manual_until,
+            "neutralised": self.neutralised,
+            "ending": self.ending,
+            "sectors": {str(k): v for k, v in self.sectors.items()},
         }
 
     # -- fan-out ----------------------------------------------
@@ -154,17 +250,6 @@ class State:
             pass
 
 
-def _from_track_status(state, status):
-    status = str(status)
-    if status in TRACK_STATUS:
-        return TRACK_STATUS[status]
-    if status == "7":
-        # Ending. Only treat as a safety car restart if we were under SC;
-        # under VSC, wait for the TRACK CLEAR race control message.
-        return Flag.GREEN if state.flag == Flag.SC else None
-    return None
-
-
 def _normalise_messages(raw):
     """SignalR deltas deliver Messages as an index-keyed object, not a list."""
     if raw is None:
@@ -174,6 +259,84 @@ def _normalise_messages(raw):
     if isinstance(raw, dict):
         return list(raw.values())
     return []
+
+
+def _handle_track_status(state, data, source):
+    code = TRACK_STATUS.get(str(data.get("Status")))
+    if not code:
+        return
+    msg = (data.get("Message") or "").strip()
+    tail = f" — TrackStatus {msg}".rstrip(" —")
+
+    if code == "ALLCLEAR":
+        # The only unambiguous end of a neutralisation.
+        if state.neutralised or state.sectors:
+            state.release(source, f"Green flag{tail}")
+        else:
+            state.set_track(Flag.GREEN, source, f"Green flag{tail}")
+    elif code == "YELLOW":
+        # Does not lift an SC/VSC latch; resolve() keeps the higher one.
+        state.set_track(Flag.YELLOW, source, f"Yellow flag{tail}")
+    elif code == "SC":
+        state.neutralise(Flag.SC, source, f"Safety car{tail}")
+    elif code == "VSC":
+        state.neutralise(Flag.VSC, source, f"Virtual safety car{tail}")
+    elif code == "RED":
+        state.set_track(Flag.RED, source, f"Red flag{tail}")
+    elif code == "ENDING":
+        # Ambiguous between SC and VSC, and only a warning either way.
+        # Hold the latch until AllClear actually arrives.
+        if state.neutralised and not state.ending:
+            state.ending = True
+            state.note(f"{Flag.LABEL[state.neutralised]} ending — holding "
+                       f"until the track is clear", kind="rc")
+            state._push(state.snapshot())
+
+
+def _handle_race_control(state, data, source):
+    for m in _normalise_messages(data.get("Messages")):
+        if not isinstance(m, dict):
+            continue
+        text = (m.get("Message") or "").strip()
+        upper = text.upper()
+        raw_flag = (m.get("Flag") or "").upper().strip()
+        flag = RC_FLAG.get(raw_flag)
+        scope = (m.get("Scope") or "Track").strip().title()
+
+        # Ending announcements are warnings. Note them, change nothing.
+        if "ENDING" in upper and ("VSC" in upper or "SAFETY CAR" in upper):
+            if state.neutralised and not state.ending:
+                state.ending = True
+                state._push(state.snapshot())
+            state.note(f"RC: {text}", kind="rc")
+            continue
+
+        if not flag:
+            if text:
+                state.note(f"RC: {text}", kind="rc")
+            continue
+
+        if flag == Flag.CHEQUERED:
+            state.neutralised = None
+            state.sectors.clear()
+            state.set_track(Flag.CHEQUERED, source,
+                            f"Chequered flag ({scope}) — {text}")
+            continue
+
+        if scope == "Sector":
+            sector = m.get("Sector")
+            if sector is None:
+                found = SECTOR_RE.search(text)
+                sector = int(found.group(1)) if found else "?"
+            state.set_sector(sector, flag, source,
+                             f"{Flag.LABEL[flag]} (Sector {sector}) — {text}")
+            continue
+
+        # Track-scoped.
+        if flag == Flag.GREEN:
+            state.release(source, f"Green flag (Track) — {text}")
+        else:
+            state.set_track(flag, source, f"{Flag.LABEL[flag]} (Track) — {text}")
 
 
 def handle_topic(state, topic, data, source):
@@ -188,30 +351,24 @@ def handle_topic(state, topic, data, source):
             state.session = " — ".join(x for x in (meeting, name) if x)
 
     elif topic == "TrackStatus":
-        flag = _from_track_status(state, data.get("Status"))
-        if flag:
-            msg = data.get("Message") or ""
-            state.raise_flag(flag, source,
-                             f"{Flag.LABEL[flag]} — TrackStatus {msg}".strip())
+        _handle_track_status(state, data, source)
 
     elif topic == "RaceControlMessages":
-        for m in _normalise_messages(data.get("Messages")):
-            if not isinstance(m, dict):
-                continue
-            text = (m.get("Message") or "").strip()
-            raw_flag = (m.get("Flag") or "").upper().strip()
-            flag = RC_FLAG.get(raw_flag)
-            if flag:
-                scope = (m.get("Scope") or "Track").title()
-                state.raise_flag(flag, source,
-                                 f"{Flag.LABEL[flag]} ({scope}) — {text}")
-            elif text:
-                state.note(f"RC: {text}", kind="rc")
+        _handle_race_control(state, data, source)
 
     elif topic == "SessionStatus":
         st = (data.get("Status") or "").lower()
-        if st in ("finished", "finalised", "ends"):
-            state.raise_flag(Flag.CHEQUERED, source, "Session finished")
+        if st in SESSION_OVER and not state.finished:
+            # The hard stop. Chequered has no ending message of its own,
+            # so the session status is the only thing that turns us off.
+            state.finished = True
+            state.neutralised = None
+            state.sectors.clear()
+            state.track = Flag.OFF
+            state.commit(source, "Session finished — lights out")
+        elif st in ("started", "inactive") and state.finished:
+            state.finished = False
+            state.commit(source, "New session — following the feed again")
 
 
 # ── SignalR client ───────────────────────────────────────────
@@ -276,10 +433,14 @@ async def _signalr_once(state):
 def _dispatch(state, frame):
     # R: the full snapshot sent immediately after Subscribe. Parse it —
     # it is the only place the current flag is stated on connect.
+    # Order matters: SessionStatus and TrackStatus set the baseline before
+    # the race control backlog replays over the top of it.
     snapshot = frame.get("R")
     if isinstance(snapshot, dict):
-        for topic, data in snapshot.items():
-            handle_topic(state, topic, data, "signalr")
+        for topic in ("SessionInfo", "SessionStatus", "TrackStatus",
+                      "RaceControlMessages"):
+            if topic in snapshot:
+                handle_topic(state, topic, snapshot[topic], "signalr")
 
     # M: deltas. A[0] is the topic name, A[1] is the payload.
     for m in frame.get("M") or []:
@@ -315,6 +476,7 @@ async def openf1_task(state):
                                  "Message": row.get("message"),
                                  "Flag": row.get("flag"),
                                  "Scope": row.get("scope"),
+                                 "Sector": row.get("sector"),
                              }]}, "openf1")
 
 
@@ -349,14 +511,25 @@ async def replay_task(state, session_key, speed):
                          "Message": row.get("message"),
                          "Flag": row.get("flag"),
                          "Scope": row.get("scope"),
+                         "Sector": row.get("sector"),
                      }]}, "replay")
     state.note("Replay finished", kind="ok")
 
 
 # ── Web ──────────────────────────────────────────────────────
+def _index_path():
+    """index.html lives at the repo root; older checkouts kept it in
+    templates/. Accept either so a fresh clone runs without moving files."""
+    here = Path(__file__).parent
+    for candidate in (here / "templates" / "index.html", here / "index.html"):
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError("index.html not found next to f1_box.py")
+
+
 async def index(request):
-    html = (Path(__file__).parent / "templates" / "index.html").read_text()
-    return web.Response(text=html, content_type="text/html")
+    return web.Response(text=_index_path().read_text(),
+                        content_type="text/html")
 
 
 async def ws_handler(request):
@@ -385,7 +558,7 @@ async def api_flag(request):
     if flag not in Flag.ALL:
         return web.json_response({"ok": False, "error": "unknown flag"},
                                  status=400)
-    state.raise_flag(flag, "manual", f"{Flag.LABEL[flag]} — set by hand")
+    state.force(flag, "manual", f"{Flag.LABEL[flag]} — set by hand")
     return web.json_response({"ok": True})
 
 
