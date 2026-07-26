@@ -37,8 +37,11 @@ read -r -p "How many LEDs are on the strip? [15]: " LED_COUNT
 LED_COUNT=${LED_COUNT:-15}
 sed -i "s/^LED_COUNT\s*=.*/LED_COUNT = $LED_COUNT          # rewritten by install.sh/" "$REPO_DIR/leds.py"
 sed -i "s/^N = .*/N = $LED_COUNT          # LEDs on the strip/" "$REPO_DIR/pico_leds.py"
-sed -i "s/repeat(15,1fr)/repeat($LED_COUNT,1fr)/" "$REPO_DIR/templates/index.html"
-sed -i "s/i < 15; i++/i < $LED_COUNT; i++/" "$REPO_DIR/templates/index.html"
+# index.html sits at the repo root; older checkouts kept it in templates/.
+INDEX_HTML="$REPO_DIR/index.html"
+[ -f "$REPO_DIR/templates/index.html" ] && INDEX_HTML="$REPO_DIR/templates/index.html"
+sed -i "s/repeat(15,1fr)/repeat($LED_COUNT,1fr)/" "$INDEX_HTML"
+sed -i "s/i < 15; i++/i < $LED_COUNT; i++/" "$INDEX_HTML"
 ok "LED count set to $LED_COUNT"
 
 if [ "$MODE" = "2" ]; then
